@@ -15,30 +15,136 @@
 //! Implementation of the NFCC.
 
 use crate::packets::{nci, rf};
-use crate::NciReader;
-use crate::NciWriter;
 use anyhow::Result;
 use core::time::Duration;
-use log::{debug, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 use pdl_runtime::Packet;
-use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::time;
 
-const NCI_VERSION: nci::NciVersion = nci::NciVersion::Version11;
+const NCI_VERSION: nci::NciVersion = nci::NciVersion::Version20;
+const MANUFACTURER_ID: u8 = 0x02;
+const MANUFACTURER_SPECIFIC_INFORMATION: [u8; 26] =
+    [5, 3, 3, 19, 4, 25, 1, 7, 0, 0, 68, 100, 214, 0, 0, 90, 172, 0, 0, 0, 1, 44, 176, 153, 243, 0];
+
+/// Read-only configuration parameters
+const PB_ATTRIB_PARAM1: u8 = 0x00;
+const LF_T3T_MAX: u8 = 16;
+const LLCP_VERSION: u8 = 0x00;
+
+/// Writable configuration parameters with default
+/// value defined by the NFCC.
+const TOTAL_DURATION: u16 = 1000;
+const PA_DEVICES_LIMIT: u8 = 255;
+const PB_DEVICES_LIMIT: u8 = 255;
+const PF_DEVICES_LIMIT: u8 = 255;
+const PV_DEVICES_LIMIT: u8 = 255;
+const LA_BIT_FRAME_SDD: u8 = 0x10;
+const LA_PLATFORM_CONFIG: u8 = 0x0c;
+const LA_SEL_INFO: u8 = 0x60; // Supports ISO-DEP and NFC-DEP.
+const LB_SENSB_INFO: u8 = 0x1; // Supports ISO-DEP.
+const LB_SFGI: u8 = 0;
+const LB_FWI_ADC_FO: u8 = 0x00;
+const LF_PROTOCOL_TYPE: u8 = 0x02; // Supports NFC-DEP.
+const LI_A_RATS_TB1: u8 = 0x70;
+const LI_A_RATS_TC1: u8 = 0x02;
+
 const MAX_LOGICAL_CONNECTIONS: u8 = 2;
 const MAX_ROUTING_TABLE_SIZE: u16 = 512;
 const MAX_CONTROL_PACKET_PAYLOAD_SIZE: u8 = 255;
 const MAX_DATA_PACKET_PAYLOAD_SIZE: u8 = 255;
-const NUMBER_OF_CREDITS: u8 = 0;
+const NUMBER_OF_CREDITS: u8 = 1;
 const MAX_NFCV_RF_FRAME_SIZE: u16 = 512;
 
 /// Time in milliseconds that Casimir waits for poll responses after
 /// sending a poll command.
 const POLL_RESPONSE_TIMEOUT: u64 = 200;
+
+/// All configuration parameters of the NFCC.
+/// The configuration is filled with default values from the specification
+/// See [NCI] Table 46: Common Parameters for Discovery Configuration
+/// for the format of each parameter and the default value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct ConfigParameters {
+    total_duration: u16,
+    /// [NCI] Table 47: Values for CON_DISCOVERY_PARAM.
+    con_discovery_param: u8,
+    power_state: u8,
+    pa_bail_out: u8,
+    pa_devices_limit: u8,
+    pb_afi: u8,
+    pb_bail_out: u8,
+    pb_attrib_param1: u8,
+    /// [NCI] Table 26: Values for PB_SENSB_REQ_PARAM.
+    pb_sensb_req_param: u8,
+    pb_devices_limit: u8,
+    pf_bit_rate: u8,
+    pf_bail_out: u8,
+    pf_devices_limit: u8,
+    pi_b_h_info: Vec<u8>,
+    pi_bit_rate: u8,
+    pn_nfc_dep_psl: u8,
+    pn_atr_req_gen_bytes: Vec<u8>,
+    /// [NCI] Table 30: Values for PN_ATR_REQ_CONFIG.
+    pn_atr_req_config: u8,
+    pv_devices_limit: u8,
+    la_bit_frame_sdd: u8,
+    la_platform_config: u8,
+    /// [NCI] Table 34: LA_SEL_INFO Coding.
+    la_sel_info: u8,
+    la_nfcid1: Vec<u8>,
+    /// [NCI] Table 36: LB_SENSB_INFO Values.
+    lb_sensb_info: u8,
+    lb_nfcid0: [u8; 4],
+    lb_application_data: u32,
+    lb_sfgi: u8,
+    /// [NCI] Table 37: LB_FWI_ADC_FO Values.
+    lb_fwi_adc_fo: u8,
+    lb_bit_rate: u8,
+    lf_t3t_identifiers_1: [u8; 18],
+    lf_t3t_identifiers_2: [u8; 18],
+    lf_t3t_identifiers_3: [u8; 18],
+    lf_t3t_identifiers_4: [u8; 18],
+    lf_t3t_identifiers_5: [u8; 18],
+    lf_t3t_identifiers_6: [u8; 18],
+    lf_t3t_identifiers_7: [u8; 18],
+    lf_t3t_identifiers_8: [u8; 18],
+    lf_t3t_identifiers_9: [u8; 18],
+    lf_t3t_identifiers_10: [u8; 18],
+    lf_t3t_identifiers_11: [u8; 18],
+    lf_t3t_identifiers_12: [u8; 18],
+    lf_t3t_identifiers_13: [u8; 18],
+    lf_t3t_identifiers_14: [u8; 18],
+    lf_t3t_identifiers_15: [u8; 18],
+    lf_t3t_identifiers_16: [u8; 18],
+    lf_t3t_pmm_default: [u8; 8],
+    lf_t3t_max: u8,
+    lf_t3t_flags: u16,
+    lf_t3t_rd_allowed: u8,
+    /// [NCI] Table 39: Supported Protocols for Listen F.
+    lf_protocol_type: u8,
+    li_a_rats_tb1: u8,
+    li_a_hist_by: Vec<u8>,
+    li_b_h_info_resp: Vec<u8>,
+    li_a_bit_rate: u8,
+    li_a_rats_tc1: u8,
+    ln_wt: u8,
+    ln_atr_res_gen_bytes: Vec<u8>,
+    ln_atr_res_config: u8,
+    pacm_bit_rate: u8,
+    /// [NCI] Table 23: RF Field Information Configuration Parameter.
+    rf_field_info: u8,
+    rf_nfcee_action: u8,
+    nfcdep_op: u8,
+    /// [NCI] Table 115: LLCP Version Parameter.
+    llcp_version: u8,
+    /// [NCI] Table 65: Value Field for NFCC Configuration Control.
+    nfcc_config_control: u8,
+}
 
 /// State of an NFCC logical connection with the DH.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -80,6 +186,14 @@ pub enum RfState {
     },
 }
 
+/// State of the emulated eSE (ST) NFCEE.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum NfceeState {
+    Enabled,
+    Disabled,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[allow(missing_docs)]
 pub enum RfMode {
@@ -100,25 +214,445 @@ pub struct RfPollResponse {
 /// State of an NFCC instance.
 #[allow(missing_docs)]
 pub struct State {
-    pub config_parameters: HashMap<nci::ConfigParameterId, Vec<u8>>,
+    pub config_parameters: ConfigParameters,
     pub logical_connections: [Option<LogicalConnection>; MAX_LOGICAL_CONNECTIONS as usize],
     pub discover_configuration: Vec<nci::DiscoverConfiguration>,
     pub discover_map: Vec<nci::MappingConfiguration>,
+    pub nfcee_state: NfceeState,
     pub rf_state: RfState,
     pub rf_poll_responses: Vec<RfPollResponse>,
-    pub passive_observer_mode: nci::PassiveObserverMode,
+    pub passive_observe_mode: nci::PassiveObserveMode,
     pub start_time: std::time::Instant,
 }
 
 /// State of an NFCC instance.
 pub struct Controller {
     id: u16,
-    nci_writer: NciWriter,
+    nci_writer: nci::Writer,
     rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
     state: Mutex<State>,
 }
 
+impl ConfigParameters {
+    fn get(&self, id: nci::ConfigParameterId) -> Result<Vec<u8>> {
+        match id {
+            nci::ConfigParameterId::TotalDuration => Ok(self.total_duration.to_le_bytes().to_vec()),
+            nci::ConfigParameterId::ConDiscoveryParam => {
+                Ok(self.con_discovery_param.to_le_bytes().to_vec())
+            }
+            nci::ConfigParameterId::PowerState => Ok(vec![self.power_state]),
+            nci::ConfigParameterId::PaBailOut => Ok(vec![self.pa_bail_out]),
+            nci::ConfigParameterId::PaDevicesLimit => Ok(vec![self.pa_devices_limit]),
+            nci::ConfigParameterId::PbAfi => Ok(vec![self.pb_afi]),
+            nci::ConfigParameterId::PbBailOut => Ok(vec![self.pb_bail_out]),
+            nci::ConfigParameterId::PbAttribParam1 => Ok(vec![self.pb_attrib_param1]),
+            nci::ConfigParameterId::PbSensbReqParam => Ok(vec![self.pb_sensb_req_param]),
+            nci::ConfigParameterId::PbDevicesLimit => Ok(vec![self.pb_devices_limit]),
+            nci::ConfigParameterId::PfBitRate => Ok(vec![self.pf_bit_rate]),
+            nci::ConfigParameterId::PfBailOut => Ok(vec![self.pf_bail_out]),
+            nci::ConfigParameterId::PfDevicesLimit => Ok(vec![self.pf_devices_limit]),
+            nci::ConfigParameterId::PiBHInfo => Ok(self.pi_b_h_info.clone()),
+            nci::ConfigParameterId::PiBitRate => Ok(vec![self.pi_bit_rate]),
+            nci::ConfigParameterId::PnNfcDepPsl => Ok(vec![self.pn_nfc_dep_psl]),
+            nci::ConfigParameterId::PnAtrReqGenBytes => Ok(self.pn_atr_req_gen_bytes.clone()),
+            nci::ConfigParameterId::PnAtrReqConfig => Ok(vec![self.pn_atr_req_config]),
+            nci::ConfigParameterId::PvDevicesLimit => Ok(vec![self.pv_devices_limit]),
+            nci::ConfigParameterId::LaBitFrameSdd => Ok(vec![self.la_bit_frame_sdd]),
+            nci::ConfigParameterId::LaPlatformConfig => Ok(vec![self.la_platform_config]),
+            nci::ConfigParameterId::LaSelInfo => Ok(vec![self.la_sel_info]),
+            nci::ConfigParameterId::LaNfcid1 => Ok(self.la_nfcid1.clone()),
+            nci::ConfigParameterId::LbSensbInfo => Ok(vec![self.lb_sensb_info]),
+            nci::ConfigParameterId::LbNfcid0 => Ok(self.lb_nfcid0.to_vec()),
+            nci::ConfigParameterId::LbApplicationData => {
+                Ok(self.lb_application_data.to_le_bytes().to_vec())
+            }
+            nci::ConfigParameterId::LbSfgi => Ok(vec![self.lb_sfgi]),
+            nci::ConfigParameterId::LbFwiAdcFo => Ok(vec![self.lb_fwi_adc_fo]),
+            nci::ConfigParameterId::LbBitRate => Ok(vec![self.lb_bit_rate]),
+            nci::ConfigParameterId::LfT3tIdentifiers1 => Ok(self.lf_t3t_identifiers_1.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers2 => Ok(self.lf_t3t_identifiers_2.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers3 => Ok(self.lf_t3t_identifiers_3.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers4 => Ok(self.lf_t3t_identifiers_4.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers5 => Ok(self.lf_t3t_identifiers_5.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers6 => Ok(self.lf_t3t_identifiers_6.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers7 => Ok(self.lf_t3t_identifiers_7.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers8 => Ok(self.lf_t3t_identifiers_8.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers9 => Ok(self.lf_t3t_identifiers_9.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers10 => Ok(self.lf_t3t_identifiers_10.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers11 => Ok(self.lf_t3t_identifiers_11.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers12 => Ok(self.lf_t3t_identifiers_12.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers13 => Ok(self.lf_t3t_identifiers_13.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers14 => Ok(self.lf_t3t_identifiers_14.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers15 => Ok(self.lf_t3t_identifiers_15.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers16 => Ok(self.lf_t3t_identifiers_16.to_vec()),
+            nci::ConfigParameterId::LfT3tPmmDefault => Ok(self.lf_t3t_pmm_default.to_vec()),
+            nci::ConfigParameterId::LfT3tMax => Ok(vec![self.lf_t3t_max]),
+            nci::ConfigParameterId::LfT3tFlags => Ok(self.lf_t3t_flags.to_le_bytes().to_vec()),
+            nci::ConfigParameterId::LfT3tRdAllowed => Ok(vec![self.lf_t3t_rd_allowed]),
+            nci::ConfigParameterId::LfProtocolType => Ok(vec![self.lf_protocol_type]),
+            nci::ConfigParameterId::LiARatsTb1 => Ok(vec![self.li_a_rats_tb1]),
+            nci::ConfigParameterId::LiAHistBy => Ok(self.li_a_hist_by.clone()),
+            nci::ConfigParameterId::LiBHInfoResp => Ok(self.li_b_h_info_resp.clone()),
+            nci::ConfigParameterId::LiABitRate => Ok(vec![self.li_a_bit_rate]),
+            nci::ConfigParameterId::LiARatsTc1 => Ok(vec![self.li_a_rats_tc1]),
+            nci::ConfigParameterId::LnWt => Ok(vec![self.ln_wt]),
+            nci::ConfigParameterId::LnAtrResGenBytes => Ok(self.ln_atr_res_gen_bytes.clone()),
+            nci::ConfigParameterId::LnAtrResConfig => Ok(vec![self.ln_atr_res_config]),
+            nci::ConfigParameterId::PacmBitRate => Ok(vec![self.pacm_bit_rate]),
+            nci::ConfigParameterId::RfFieldInfo => Ok(vec![self.rf_field_info]),
+            nci::ConfigParameterId::RfNfceeAction => Ok(vec![self.rf_nfcee_action]),
+            nci::ConfigParameterId::NfcdepOp => Ok(vec![self.nfcdep_op]),
+            nci::ConfigParameterId::LlcpVersion => Ok(vec![self.llcp_version]),
+            nci::ConfigParameterId::NfccConfigControl => Ok(vec![self.nfcc_config_control]),
+            _ => Err(anyhow::anyhow!("unknown config parameter ID")),
+        }
+    }
+
+    fn set(&mut self, id: nci::ConfigParameterId, value: &[u8]) -> Result<()> {
+        match id {
+            nci::ConfigParameterId::TotalDuration => {
+                self.total_duration = u16::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::ConDiscoveryParam => {
+                self.con_discovery_param = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PowerState => {
+                self.power_state = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PaBailOut => {
+                self.pa_bail_out = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PaDevicesLimit => {
+                self.pa_devices_limit = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PbAfi => {
+                self.pb_afi = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PbBailOut => {
+                self.pb_bail_out = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PbAttribParam1 => {
+                self.pb_attrib_param1 = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PbSensbReqParam => {
+                self.pb_sensb_req_param = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PbDevicesLimit => {
+                self.pb_devices_limit = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PfBitRate => {
+                self.pf_bit_rate = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PfBailOut => {
+                self.pf_bail_out = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PfDevicesLimit => {
+                self.pf_devices_limit = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PiBHInfo => {
+                self.pi_b_h_info = value.to_vec();
+                Ok(())
+            }
+            nci::ConfigParameterId::PiBitRate => {
+                self.pi_bit_rate = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PnNfcDepPsl => {
+                self.pn_nfc_dep_psl = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PnAtrReqGenBytes => {
+                self.pn_atr_req_gen_bytes = value.to_vec();
+                Ok(())
+            }
+            nci::ConfigParameterId::PnAtrReqConfig => {
+                self.pn_atr_req_config = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PvDevicesLimit => {
+                self.pv_devices_limit = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LaBitFrameSdd => {
+                self.la_bit_frame_sdd = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LaPlatformConfig => {
+                self.la_platform_config = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LaSelInfo => {
+                self.la_sel_info = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LaNfcid1 => {
+                self.la_nfcid1 = value.to_vec();
+                Ok(())
+            }
+            nci::ConfigParameterId::LbSensbInfo => {
+                self.lb_sensb_info = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LbNfcid0 => {
+                self.lb_nfcid0 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LbApplicationData => {
+                self.lb_application_data = u32::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LbSfgi => {
+                self.lb_sfgi = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LbFwiAdcFo => {
+                self.lb_fwi_adc_fo = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LbBitRate => {
+                self.lb_bit_rate = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers1 => {
+                self.lf_t3t_identifiers_1 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers2 => {
+                self.lf_t3t_identifiers_2 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers3 => {
+                self.lf_t3t_identifiers_3 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers4 => {
+                self.lf_t3t_identifiers_4 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers5 => {
+                self.lf_t3t_identifiers_5 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers6 => {
+                self.lf_t3t_identifiers_6 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers7 => {
+                self.lf_t3t_identifiers_7 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers8 => {
+                self.lf_t3t_identifiers_8 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers9 => {
+                self.lf_t3t_identifiers_9 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers10 => {
+                self.lf_t3t_identifiers_10 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers11 => {
+                self.lf_t3t_identifiers_11 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers12 => {
+                self.lf_t3t_identifiers_12 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers13 => {
+                self.lf_t3t_identifiers_13 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers14 => {
+                self.lf_t3t_identifiers_14 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers15 => {
+                self.lf_t3t_identifiers_15 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers16 => {
+                self.lf_t3t_identifiers_16 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tPmmDefault => {
+                self.lf_t3t_pmm_default = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tMax => Err(anyhow::anyhow!("read-only config parameter")),
+            nci::ConfigParameterId::LfT3tFlags => {
+                self.lf_t3t_flags = u16::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tRdAllowed => {
+                self.lf_t3t_rd_allowed = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LfProtocolType => {
+                self.lf_protocol_type = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LiARatsTb1 => {
+                self.li_a_rats_tb1 = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LiAHistBy => {
+                self.li_a_hist_by = value.to_vec();
+                Ok(())
+            }
+            nci::ConfigParameterId::LiBHInfoResp => {
+                self.li_b_h_info_resp = value.to_vec();
+                Ok(())
+            }
+            nci::ConfigParameterId::LiABitRate => {
+                self.li_a_bit_rate = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LiARatsTc1 => {
+                self.li_a_rats_tc1 = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LnWt => {
+                self.ln_wt = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LnAtrResGenBytes => {
+                self.ln_atr_res_gen_bytes = value.to_vec();
+                Ok(())
+            }
+            nci::ConfigParameterId::LnAtrResConfig => {
+                self.ln_atr_res_config = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PacmBitRate => {
+                self.pacm_bit_rate = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::RfFieldInfo => {
+                self.rf_field_info = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::RfNfceeAction => {
+                self.rf_nfcee_action = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::NfcdepOp => {
+                self.nfcdep_op = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LlcpVersion => {
+                self.llcp_version = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::NfccConfigControl => {
+                self.nfcc_config_control = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            _ => Err(anyhow::anyhow!("unknown config parameter ID")),
+        }
+    }
+}
+
+impl Default for ConfigParameters {
+    fn default() -> Self {
+        ConfigParameters {
+            total_duration: TOTAL_DURATION,
+            con_discovery_param: 0x01,
+            power_state: 0x02,
+            pa_bail_out: 0x00,
+            pa_devices_limit: PA_DEVICES_LIMIT,
+            pb_afi: 0x00,
+            pb_bail_out: 0x00,
+            pb_attrib_param1: PB_ATTRIB_PARAM1,
+            pb_sensb_req_param: 0x00,
+            pb_devices_limit: PB_DEVICES_LIMIT,
+            pf_bit_rate: 0x01,
+            pf_bail_out: 0x00,
+            pf_devices_limit: PF_DEVICES_LIMIT,
+            pi_b_h_info: vec![],
+            pi_bit_rate: 0x00,
+            pn_nfc_dep_psl: 0x00,
+            pn_atr_req_gen_bytes: vec![],
+            pn_atr_req_config: 0x30,
+            pv_devices_limit: PV_DEVICES_LIMIT,
+            la_bit_frame_sdd: LA_BIT_FRAME_SDD,
+            la_platform_config: LA_PLATFORM_CONFIG,
+            la_sel_info: LA_SEL_INFO,
+            la_nfcid1: vec![0x08, 0x00, 0x00, 0x00],
+            lb_sensb_info: LB_SENSB_INFO,
+            lb_nfcid0: [0x08, 0x00, 0x00, 0x00],
+            lb_application_data: 0x00000000,
+            lb_sfgi: LB_SFGI,
+            lb_fwi_adc_fo: LB_FWI_ADC_FO,
+            lb_bit_rate: 0x00,
+            lf_t3t_identifiers_1: [0; 18],
+            lf_t3t_identifiers_2: [0; 18],
+            lf_t3t_identifiers_3: [0; 18],
+            lf_t3t_identifiers_4: [0; 18],
+            lf_t3t_identifiers_5: [0; 18],
+            lf_t3t_identifiers_6: [0; 18],
+            lf_t3t_identifiers_7: [0; 18],
+            lf_t3t_identifiers_8: [0; 18],
+            lf_t3t_identifiers_9: [0; 18],
+            lf_t3t_identifiers_10: [0; 18],
+            lf_t3t_identifiers_11: [0; 18],
+            lf_t3t_identifiers_12: [0; 18],
+            lf_t3t_identifiers_13: [0; 18],
+            lf_t3t_identifiers_14: [0; 18],
+            lf_t3t_identifiers_15: [0; 18],
+            lf_t3t_identifiers_16: [0; 18],
+            lf_t3t_pmm_default: [0xff; 8],
+            lf_t3t_max: LF_T3T_MAX,
+            lf_t3t_flags: 0x0000,
+            lf_t3t_rd_allowed: 0x00,
+            lf_protocol_type: LF_PROTOCOL_TYPE,
+            li_a_rats_tb1: LI_A_RATS_TB1,
+            li_a_hist_by: vec![],
+            li_b_h_info_resp: vec![],
+            li_a_bit_rate: 0x00,
+            li_a_rats_tc1: LI_A_RATS_TC1,
+            ln_wt: 10,
+            ln_atr_res_gen_bytes: vec![],
+            ln_atr_res_config: 0x30,
+            pacm_bit_rate: 0x01,
+            rf_field_info: 0x00,
+            rf_nfcee_action: 0x01,
+            // [NCI] Table 101: NFC-DEP Operation Parameter.
+            nfcdep_op: 0x1f,
+            llcp_version: LLCP_VERSION,
+            nfcc_config_control: 0x00,
+        }
+    }
+}
+
 impl State {
+    /// Craft the NFCID1 used by this instance in NFC-A poll responses.
+    /// Returns a dynamically generated NFCID1 (4 byte long and starts with 08h).
+    fn nfcid1(&self) -> Vec<u8> {
+        if self.config_parameters.la_nfcid1.len() == 4
+            && self.config_parameters.la_nfcid1[0] == 0x08
+        {
+            vec![0x08, 186, 7, 99] // TODO(hchataing) pseudo random
+        } else {
+            self.config_parameters.la_nfcid1.clone()
+        }
+    }
+
     /// Select the interface to be preferably used for the selected protocol.
     fn select_interface(
         &self,
@@ -170,7 +704,7 @@ impl Controller {
     /// Create a new NFCC instance with default configuration.
     pub fn new(
         id: u16,
-        nci_writer: NciWriter,
+        nci_writer: nci::Writer,
         rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
     ) -> Controller {
         Controller {
@@ -178,22 +712,17 @@ impl Controller {
             nci_writer,
             rf_tx,
             state: Mutex::new(State {
-                config_parameters: HashMap::new(),
+                config_parameters: Default::default(),
                 logical_connections: [None; MAX_LOGICAL_CONNECTIONS as usize],
                 discover_map: vec![],
                 discover_configuration: vec![],
+                nfcee_state: NfceeState::Disabled,
                 rf_state: RfState::Idle,
                 rf_poll_responses: vec![],
-                passive_observer_mode: nci::PassiveObserverMode::Disable,
+                passive_observe_mode: nci::PassiveObserveMode::Disable,
                 start_time: Instant::now(),
             }),
         }
-    }
-
-    /// Craft the NFCID1 used by this instance in NFC-A poll responses.
-    /// Returns a dynamically generated NFCID1 (4 byte long and starts with 08h).
-    fn nfcid1(&self) -> Vec<u8> {
-        vec![0x08, self.id as u8, (self.id >> 8) as u8, 0]
     }
 
     async fn send_control(&self, packet: impl Into<nci::ControlPacket>) -> Result<()> {
@@ -217,7 +746,7 @@ impl Controller {
 
         match cmd.get_reset_type() {
             nci::ResetType::KeepConfig => (),
-            nci::ResetType::ResetConfig => state.config_parameters.clear(),
+            nci::ResetType::ResetConfig => state.config_parameters = Default::default(),
         }
 
         for i in 0..MAX_LOGICAL_CONNECTIONS {
@@ -238,8 +767,8 @@ impl Controller {
                 nci::ResetType::ResetConfig => nci::ConfigStatus::ConfigReset,
             },
             nci_version: NCI_VERSION,
-            manufacturer_id: 0,
-            manufacturer_specific_information: vec![],
+            manufacturer_id: MANUFACTURER_ID,
+            manufacturer_specific_information: MANUFACTURER_SPECIFIC_INFORMATION.to_vec(),
         })
         .await?;
 
@@ -254,17 +783,17 @@ impl Controller {
             nfcc_features: nci::NfccFeatures {
                 discovery_frequency_configuration: nci::FeatureFlag::Disabled,
                 discovery_configuration_mode: nci::DiscoveryConfigurationMode::DhOnly,
-                hci_network_support: nci::FeatureFlag::Disabled,
-                active_communication_mode: nci::FeatureFlag::Disabled,
-                technology_based_routing: nci::FeatureFlag::Disabled,
-                protocol_based_routing: nci::FeatureFlag::Disabled,
-                aid_based_routing: nci::FeatureFlag::Disabled,
-                system_code_based_routing: nci::FeatureFlag::Disabled,
-                apdu_pattern_based_routing: nci::FeatureFlag::Disabled,
-                forced_nfcee_routing: nci::FeatureFlag::Disabled,
+                hci_network_support: nci::FeatureFlag::Enabled,
+                active_communication_mode: nci::FeatureFlag::Enabled,
+                technology_based_routing: nci::FeatureFlag::Enabled,
+                protocol_based_routing: nci::FeatureFlag::Enabled,
+                aid_based_routing: nci::FeatureFlag::Enabled,
+                system_code_based_routing: nci::FeatureFlag::Enabled,
+                apdu_pattern_based_routing: nci::FeatureFlag::Enabled,
+                forced_nfcee_routing: nci::FeatureFlag::Enabled,
                 battery_off_state: nci::FeatureFlag::Disabled,
-                switched_off_state: nci::FeatureFlag::Disabled,
-                switched_on_substates: nci::FeatureFlag::Disabled,
+                switched_off_state: nci::FeatureFlag::Enabled,
+                switched_on_substates: nci::FeatureFlag::Enabled,
                 rf_configuration_in_switched_off_state: nci::FeatureFlag::Disabled,
                 proprietary_capabilities: 0,
             },
@@ -276,11 +805,12 @@ impl Controller {
             max_nfcv_rf_frame_size: MAX_NFCV_RF_FRAME_SIZE,
             supported_rf_interfaces: vec![
                 nci::RfInterface { interface: nci::RfInterfaceType::Frame, extensions: vec![] },
+                nci::RfInterface { interface: nci::RfInterfaceType::IsoDep, extensions: vec![] },
+                nci::RfInterface { interface: nci::RfInterfaceType::NfcDep, extensions: vec![] },
                 nci::RfInterface {
                     interface: nci::RfInterfaceType::NfceeDirect,
-                    extensions: vec![nci::RfInterfaceExtensionType::FrameAggregated],
+                    extensions: vec![],
                 },
-                nci::RfInterface { interface: nci::RfInterfaceType::NfcDep, extensions: vec![] },
             ],
         })
         .await?;
@@ -311,7 +841,9 @@ impl Controller {
                 // with a Status value of STATUS_SEMANTIC_ERROR and no
                 // additional fields.
                 _ => {
-                    state.config_parameters.insert(parameter.id, parameter.value.clone());
+                    if state.config_parameters.set(parameter.id, &parameter.value).is_err() {
+                        invalid_parameters.push(parameter.id)
+                    }
                 }
             }
         }
@@ -348,11 +880,11 @@ impl Controller {
         let mut invalid_parameters = vec![];
         for id in cmd.get_parameters() {
             info!("         ID: {:?}", id);
-            match state.config_parameters.get(id) {
-                Some(value) => {
-                    valid_parameters.push(nci::ConfigParameter { id: *id, value: value.clone() })
+            match state.config_parameters.get(*id) {
+                Ok(value) => {
+                    valid_parameters.push(nci::ConfigParameter { id: *id, value: value.to_vec() })
                 }
-                None => invalid_parameters.push(nci::ConfigParameter { id: *id, value: vec![] }),
+                Err(_) => invalid_parameters.push(nci::ConfigParameter { id: *id, value: vec![] }),
             }
         }
 
@@ -615,6 +1147,8 @@ impl Controller {
             return Ok(());
         }
 
+        self.send_control(nci::RfDiscoverSelectResponseBuilder { status: nci::Status::Ok }).await?;
+
         // Send RF select command to the peer to activate the device.
         // The command has varying parameters based on the activated protocol.
         self.activate_poll_interface(
@@ -643,14 +1177,14 @@ impl Controller {
             (RfState::PollActive { .. }, SleepMode | SleepAfMode) => {
                 (nci::Status::Ok, RfState::WaitForHostSelect)
             }
-            (RfState::PollActive { .. }, Discover) => (nci::Status::Ok, RfState::Discovery),
+            (RfState::PollActive { .. }, Discovery) => (nci::Status::Ok, RfState::Discovery),
             (RfState::ListenSleep { .. }, IdleMode) => (nci::Status::Ok, RfState::Idle),
             (RfState::ListenSleep { .. }, _) => (nci::Status::SemanticError, state.rf_state),
             (RfState::ListenActive { .. }, IdleMode) => (nci::Status::Ok, RfState::Idle),
             (RfState::ListenActive { id, .. }, SleepMode | SleepAfMode) => {
                 (nci::Status::Ok, RfState::ListenSleep { id })
             }
-            (RfState::ListenActive { .. }, Discover) => (nci::Status::Ok, RfState::Discovery),
+            (RfState::ListenActive { .. }, Discovery) => (nci::Status::Ok, RfState::Discovery),
             (RfState::WaitForHostSelect, IdleMode) => (nci::Status::Ok, RfState::Idle),
             (RfState::WaitForHostSelect, _) => {
                 (nci::Status::SemanticError, RfState::WaitForHostSelect)
@@ -692,7 +1226,8 @@ impl Controller {
                     protocol: rf_protocol,
                     technology: rf_technology,
                     sender: self.id,
-                    reason: rf::DeactivateReason::DhRequest,
+                    type_: cmd.get_deactivation_type().into(),
+                    reason: rf::DeactivateReason::EndpointRequest,
                 })
                 .await?
             }
@@ -707,24 +1242,112 @@ impl Controller {
 
         self.send_control(nci::NfceeDiscoverResponseBuilder {
             status: nci::Status::Ok,
-            number_of_nfcees: 0,
+            number_of_nfcees: 1,
+        })
+        .await?;
+
+        self.send_control(nci::NfceeDiscoverNotificationBuilder {
+            nfcee_id: nci::NfceeId::hci_nfcee(0x86),
+            nfcee_status: nci::NfceeStatus::Disabled,
+            supported_nfcee_protocols: vec![],
+            nfcee_information: vec![nci::NfceeInformation {
+                r#type: nci::NfceeInformationType::HostId,
+                value: vec![0xc0],
+            }],
+            nfcee_supply_power: nci::NfceeSupplyPower::NfccHasNoControl,
         })
         .await?;
 
         Ok(())
     }
 
-    async fn android_passive_observer_mode(
-        &self,
-        cmd: nci::AndroidPassiveObserverModeCommand,
-    ) -> Result<()> {
-        info!("[{}] ANDROID_PASSIVE_OBSERVER_MODE_CMD", self.id);
-        info!("     Mode: {:?}", cmd.get_passive_observer_mode());
+    async fn nfcee_mode_set(&self, cmd: nci::NfceeModeSetCommand) -> Result<()> {
+        info!("[{}] NFCEE_MODE_SET_CMD", self.id);
+        info!("         NFCEE ID: {:?}", cmd.get_nfcee_id());
+        info!("         NFCEE Mode: {:?}", cmd.get_nfcee_mode());
+
+        if cmd.get_nfcee_id() != nci::NfceeId::hci_nfcee(0x86) {
+            warn!("[{}] nfcee_mode_set with invalid nfcee_id", self.id);
+            self.send_control(nci::NfceeModeSetResponseBuilder { status: nci::Status::Ok }).await?;
+            return Ok(());
+        }
 
         let mut state = self.state.lock().await;
-        state.passive_observer_mode = cmd.get_passive_observer_mode();
-        self.send_control(nci::AndroidPassiveObserverModeResponseBuilder {
+        state.nfcee_state = match cmd.get_nfcee_mode() {
+            nci::NfceeMode::Enable => NfceeState::Enabled,
+            nci::NfceeMode::Disable => NfceeState::Disabled,
+        };
+
+        self.send_control(nci::NfceeModeSetResponseBuilder { status: nci::Status::Ok }).await?;
+
+        self.send_control(nci::NfceeModeSetNotificationBuilder { status: nci::Status::Ok }).await?;
+
+        if state.nfcee_state == NfceeState::Enabled {
+            // Android host stack expects this notification to know when the
+            // NFCEE completes start-up. The list of information entries is
+            // filled with defaults observed on real phones.
+            self.send_data(nci::DataPacketBuilder {
+                mt: nci::MessageType::Data,
+                conn_id: nci::ConnId::StaticHci,
+                cr: 0,
+                payload: Some(bytes::Bytes::copy_from_slice(&[0x81, 0x43, 0xc0, 0x01])),
+            })
+            .await?;
+
+            self.send_control(nci::RfNfceeDiscoveryReqNotificationBuilder {
+                information_entries: vec![
+                    nci::InformationEntry {
+                        r#type: nci::InformationEntryType::AddDiscoveryRequest,
+                        nfcee_id: nci::NfceeId::hci_nfcee(0x86),
+                        rf_technology_and_mode: nci::RfTechnologyAndMode::NfcFPassiveListenMode,
+                        rf_protocol: nci::RfProtocolType::T3t,
+                    },
+                    nci::InformationEntry {
+                        r#type: nci::InformationEntryType::AddDiscoveryRequest,
+                        nfcee_id: nci::NfceeId::hci_nfcee(0x86),
+                        rf_technology_and_mode: nci::RfTechnologyAndMode::NfcAPassiveListenMode,
+                        rf_protocol: nci::RfProtocolType::IsoDep,
+                    },
+                    nci::InformationEntry {
+                        r#type: nci::InformationEntryType::AddDiscoveryRequest,
+                        nfcee_id: nci::NfceeId::hci_nfcee(0x86),
+                        rf_technology_and_mode: nci::RfTechnologyAndMode::NfcBPassiveListenMode,
+                        rf_protocol: nci::RfProtocolType::IsoDep,
+                    },
+                ],
+            })
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn android_passive_observe_mode(
+        &self,
+        cmd: nci::AndroidPassiveObserveModeCommand,
+    ) -> Result<()> {
+        info!("[{}] ANDROID_PASSIVE_OBSERVE_MODE_CMD", self.id);
+        info!("     Mode: {:?}", cmd.get_passive_observe_mode());
+
+        let mut state = self.state.lock().await;
+        state.passive_observe_mode = cmd.get_passive_observe_mode();
+        self.send_control(nci::AndroidPassiveObserveModeResponseBuilder {
             status: nci::Status::Ok,
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn android_query_passive_observe_mode(
+        &self,
+        _cmd: nci::AndroidQueryPassiveObserveModeCommand,
+    ) -> Result<()> {
+        info!("[{}] ANDROID_QUERY_PASSIVE_OBSERVE_MODE_CMD", self.id);
+
+        let state = self.state.lock().await;
+        self.send_control(nci::AndroidQueryPassiveObserveModeResponseBuilder {
+            status: nci::Status::Ok,
+            passive_observe_mode: state.passive_observe_mode,
         })
         .await?;
         Ok(())
@@ -760,12 +1383,16 @@ impl Controller {
             },
             NfceePacket(packet) => match packet.specialize() {
                 NfceeDiscoverCommand(cmd) => self.nfcee_discover(cmd).await,
+                NfceeModeSetCommand(cmd) => self.nfcee_mode_set(cmd).await,
                 _ => unimplemented!("unsupported nfcee oid {:?}", packet.get_oid()),
             },
             ProprietaryPacket(packet) => match packet.specialize() {
                 AndroidPacket(packet) => match packet.specialize() {
-                    AndroidPassiveObserverModeCommand(cmd) => {
-                        self.android_passive_observer_mode(cmd).await
+                    AndroidPassiveObserveModeCommand(cmd) => {
+                        self.android_passive_observe_mode(cmd).await
+                    }
+                    AndroidQueryPassiveObserveModeCommand(cmd) => {
+                        self.android_query_passive_observe_mode(cmd).await
                     }
                     _ => {
                         unimplemented!("unsupported android oid {:?}", packet.get_android_sub_oid())
@@ -817,6 +1444,48 @@ impl Controller {
                 )
                 .await
             }
+            RfState::PollActive {
+                rf_protocol: rf::Protocol::IsoDep,
+                rf_interface: nci::RfInterfaceType::Frame,
+                ..
+            } => {
+                println!("ISO-DEP frame data {:?}", packet.get_payload());
+                match packet.get_payload() {
+                    // RATS command
+                    // TODO(henrichataing) Send back the response received from
+                    // the peer in the RF packet.
+                    [0xe0, _] => {
+                        self.send_data(nci::DataPacketBuilder {
+                            mt: nci::MessageType::Data,
+                            conn_id: nci::ConnId::StaticRf,
+                            cr: 0,
+                            payload: Some(bytes::Bytes::copy_from_slice(&[120, 128, 112, 2])),
+                        })
+                        .await?
+                    }
+                    // DESELECT command
+                    // TODO(henrichataing) check if the command should be
+                    // forwarded to the peer, and if it warrants a response
+                    [0xc2] => (),
+                    // SLP_REQ command
+                    // No response is expected for this command.
+                    // TODO(henrichataing) forward a deactivation request to
+                    // the peer and deactivate the local interface.
+                    [0x50, 0x00] => (),
+                    _ => unimplemented!(),
+                };
+                // Resplenish the credit count for the RF Connection.
+                self.send_control(
+                    nci::CoreConnCreditsNotificationBuilder {
+                        connections: vec![nci::ConnectionCredits {
+                            conn_id: nci::ConnId::StaticRf,
+                            credits: 1,
+                        }],
+                    }
+                    .build(),
+                )
+                .await
+            }
             RfState::PollActive { rf_protocol, rf_interface, .. }
             | RfState::ListenActive { rf_protocol, rf_interface, .. } => unimplemented!(
                 "unsupported combination of RF protocol {:?} and interface {:?}",
@@ -833,9 +1502,50 @@ impl Controller {
         }
     }
 
-    async fn hci_conn_data(&self, _packet: nci::DataPacket) -> Result<()> {
+    async fn hci_conn_data(&self, packet: nci::DataPacket) -> Result<()> {
         info!("[{}] received data on HCI logical connection", self.id);
-        todo!()
+
+        // TODO: parse and understand HCI Control Protocol (HCP)
+        // to accurately respond to the requests. For now it is sufficient
+        // to return hardcoded answers to identified requests.
+        let response = match packet.get_payload() {
+            // ANY_OPEN_PIPE()
+            [0x81, 0x03] => vec![0x81, 0x80],
+            // ANY_GET_PARAMETER(index=1)
+            [0x81, 0x02, 0x01] => vec![0x81, 0x80, 0xd7, 0xfe, 0x65, 0x66, 0xc7, 0xfe, 0x65, 0x66],
+            // ANY_GET_PARAMETER(index=4)
+            [0x81, 0x02, 0x04] => vec![0x81, 0x80, 0x00, 0xc0, 0x01],
+            // ANY_SET_PARAMETER()
+            [0x81, 0x01, 0x03, 0x02, 0xc0]
+            | [0x81, 0x01, 0x03, _, _, _]
+            | [0x81, 0x01, 0x01, _, 0x00, 0x00, 0x00, _, 0x00, 0x00, 0x00] => vec![0x81, 0x80],
+            // ADM_CLEAR_ALL_PIPE()
+            [0x81, 0x14, 0x02, 0x01] => vec![0x81, 0x80],
+            _ => {
+                error!("unimplemented HCI command : {:?}", packet.get_payload());
+                unimplemented!()
+            }
+        };
+
+        self.send_data(nci::DataPacketBuilder {
+            mt: nci::MessageType::Data,
+            conn_id: nci::ConnId::StaticHci,
+            cr: 0,
+            payload: Some(bytes::Bytes::copy_from_slice(&response)),
+        })
+        .await?;
+
+        // Resplenish the credit count for the HCI Connection.
+        self.send_control(
+            nci::CoreConnCreditsNotificationBuilder {
+                connections: vec![nci::ConnectionCredits {
+                    conn_id: nci::ConnId::StaticHci,
+                    credits: 1,
+                }],
+            }
+            .build(),
+        )
+        .await
     }
 
     async fn dynamic_conn_data(&self, _conn_id: u8, _packet: nci::DataPacket) -> Result<()> {
@@ -865,8 +1575,8 @@ impl Controller {
         // Android proprietary extension for polling frame notifications.
         // The NFCC should send the NCI_ANDROID_POLLING_FRAME_NTF to the Host
         // after each polling loop frame
-        // This notification is independent of whether Passive Observer Mode is
-        // active or not. When Passive Observer Mode is active, the NFCC
+        // This notification is independent of whether Passive Observe Mode is
+        // active or not. When Passive Observe Mode is active, the NFCC
         // should always send this notification before proceeding with the
         // transaction.
         self.send_control(nci::AndroidPollingLoopNotificationBuilder {
@@ -877,6 +1587,7 @@ impl Controller {
                     rf::Technology::NfcF => nci::PollingFrameType::Reqf,
                     rf::Technology::NfcV => nci::PollingFrameType::Reqv,
                 },
+                flags: 0,
                 timestamp: state.start_time.elapsed().as_millis() as u32,
                 gain: 2,
                 data: vec![],
@@ -884,10 +1595,10 @@ impl Controller {
         })
         .await?;
 
-        // When the Passive Observer Mode is active, the NFCC shall not respond
+        // When the Passive Observe Mode is active, the NFCC shall not respond
         // to any poll requests during the polling loop in Listen Mode, until
         // explicitly authorized by the Host.
-        if state.passive_observer_mode == nci::PassiveObserverMode::Enable {
+        if state.passive_observe_mode == nci::PassiveObserveMode::Enable {
             return Ok(());
         }
 
@@ -901,14 +1612,13 @@ impl Controller {
         }) {
             match technology {
                 rf::Technology::NfcA => {
-                    // Configured for T4AT tag emulation.
-                    let int_protocol = 0x01;
                     self.send_rf(rf::NfcAPollResponseBuilder {
                         protocol: rf::Protocol::Undetermined,
                         receiver: cmd.get_sender(),
                         sender: self.id,
-                        nfcid1: self.nfcid1(),
-                        int_protocol,
+                        nfcid1: state.nfcid1(),
+                        int_protocol: state.config_parameters.la_sel_info >> 5,
+                        bit_frame_sdd: state.config_parameters.la_bit_frame_sdd,
                     })
                     .await?
                 }
@@ -942,7 +1652,7 @@ impl Controller {
             7 => 0x40,
             10 => 0x80,
             _ => panic!(),
-        };
+        } | cmd.get_bit_frame_sdd() as u16;
         let sel_res = int_protocol << 5;
 
         for rf_protocol in rf_protocols {
@@ -968,9 +1678,11 @@ impl Controller {
         info!("[{}] t4at_select_command()", self.id);
 
         let mut state = self.state.lock().await;
-        if state.rf_state != RfState::Discovery {
-            return Ok(());
-        }
+        match state.rf_state {
+            RfState::Discovery => (),
+            RfState::ListenSleep { id } if id == cmd.get_sender() => (),
+            _ => return Ok(()),
+        };
 
         // TODO(henrichataing): validate that the protocol and technology are
         // valid for the current discovery settings.
@@ -985,25 +1697,34 @@ impl Controller {
             rf_interface: nci::RfInterfaceType::IsoDep,
         };
 
+        // [DIGITAL] 14.6.2 RATS Response (Answer To Select)
+        // Construct the response from the values passed in the configuration
+        // parameters. The TL byte is excluded from the response.
+        let mut rats_response = vec![
+            0x78, // TC(1), TB(1), TA(1) transmitted, FSCI=8
+            0x80, // TA(1)
+            state.config_parameters.li_a_rats_tb1,
+            state.config_parameters.li_a_rats_tc1,
+        ];
+
+        rats_response.extend_from_slice(&state.config_parameters.li_a_hist_by);
+
         self.send_rf(rf::T4ATSelectResponseBuilder {
             receiver: cmd.get_sender(),
             sender: self.id,
-            // [DIGITAL] 14.6.2 RATS Response (Answer To Select)
-            // TODO(henrichataing): this value is just a valid default;
-            // construct the RATS response from global capabilities.
-            rats_response: vec![0x2, 0x0],
+            rats_response,
         })
         .await?;
 
         info!("[{}] RF_INTF_ACTIVATED_NTF", self.id);
-        info!("         DiscoveryID: {:?}", nci::RfDiscoveryId::reserved());
+        info!("         DiscoveryID: {:?}", nci::RfDiscoveryId::from_index(0));
         info!("         Interface: ISO-DEP");
         info!("         Protocol: ISO-DEP");
         info!("         ActivationTechnology: NFC_A_PASSIVE_LISTEN");
         info!("         RATS: {}", cmd.get_param());
 
         self.send_control(nci::RfIntfActivatedNotificationBuilder {
-            rf_discovery_id: nci::RfDiscoveryId::reserved(),
+            rf_discovery_id: nci::RfDiscoveryId::from_index(0),
             rf_interface: nci::RfInterfaceType::IsoDep,
             rf_protocol: nci::RfProtocolType::IsoDep,
             activation_rf_technology_and_mode: nci::RfTechnologyAndMode::NfcAPassiveListenMode,
@@ -1127,17 +1848,31 @@ impl Controller {
     async fn deactivate_notification(&self, cmd: rf::DeactivateNotification) -> Result<()> {
         info!("[{}] deactivate_notification()", self.id);
 
+        use rf::DeactivateType::*;
+
         let mut state = self.state.lock().await;
-        let mut next_state = match state.rf_state {
-            RfState::PollActive { id, .. }
-            | RfState::ListenSleep { id }
-            | RfState::ListenActive { id, .. }
-            | RfState::WaitForSelectResponse { id, .. }
+        let mut next_state = match (state.rf_state, cmd.get_type_()) {
+            (RfState::PollActive { id, .. }, IdleMode) if id == cmd.get_sender() => RfState::Idle,
+            (RfState::PollActive { id, .. }, SleepMode | SleepAfMode) if id == cmd.get_sender() => {
+                RfState::WaitForHostSelect
+            }
+            (RfState::PollActive { id, .. }, Discovery) if id == cmd.get_sender() => {
+                RfState::Discovery
+            }
+            (RfState::ListenSleep { id, .. }, IdleMode) if id == cmd.get_sender() => RfState::Idle,
+            (RfState::ListenSleep { id, .. }, Discovery) if id == cmd.get_sender() => {
+                RfState::Discovery
+            }
+            (RfState::ListenActive { id, .. }, IdleMode) if id == cmd.get_sender() => RfState::Idle,
+            (RfState::ListenActive { id, .. }, SleepMode | SleepAfMode)
                 if id == cmd.get_sender() =>
             {
-                RfState::Idle
+                RfState::ListenSleep { id }
             }
-            _ => state.rf_state,
+            (RfState::ListenActive { id, .. }, Discovery) if id == cmd.get_sender() => {
+                RfState::Discovery
+            }
+            (_, _) => state.rf_state,
         };
 
         // Update the state now to prevent interface activation from
@@ -1147,7 +1882,7 @@ impl Controller {
         // Deactivate the active RF interface if applicable.
         if next_state != state.rf_state {
             self.send_control(nci::RfDeactivateNotificationBuilder {
-                deactivation_type: nci::DeactivationType::IdleMode,
+                deactivation_type: cmd.get_type_().into(),
                 deactivation_reason: cmd.get_reason().into(),
             })
             .await?
@@ -1170,8 +1905,9 @@ impl Controller {
             // changed to RFST_LISTEN_ACTIVE.
             T4ATSelectCommand(cmd) => self.t4at_select_command(cmd).await,
             T4ATSelectResponse(cmd) => self.t4at_select_response(cmd).await,
-            Data(cmd) => self.data_packet(cmd).await,
+            SelectCommand(_) => unimplemented!(),
             DeactivateNotification(cmd) => self.deactivate_notification(cmd).await,
+            Data(cmd) => self.data_packet(cmd).await,
             _ => unimplemented!(),
         }
     }
@@ -1196,8 +1932,8 @@ impl Controller {
         info!("[{}] activate_poll_interface({:?})", self.id, rf_interface);
 
         let rf_technology = state.rf_poll_responses[rf_discovery_id].rf_technology;
-        match (rf_interface, rf_technology) {
-            (nci::RfInterfaceType::Frame, rf::Technology::NfcA) => {
+        match (rf_protocol, rf_technology) {
+            (nci::RfProtocolType::T2t, rf::Technology::NfcA) => {
                 self.send_rf(rf::SelectCommandBuilder {
                     sender: self.id,
                     receiver: state.rf_poll_responses[rf_discovery_id].id,
@@ -1206,15 +1942,18 @@ impl Controller {
                 })
                 .await?
             }
-            (nci::RfInterfaceType::IsoDep, rf::Technology::NfcA) => {
+            (nci::RfProtocolType::IsoDep, rf::Technology::NfcA) => {
                 self.send_rf(rf::T4ATSelectCommandBuilder {
                     sender: self.id,
                     receiver: state.rf_poll_responses[rf_discovery_id].id,
-                    param: 0,
+                    // [DIGITAL] 14.6.1.6 The FSD supported by the
+                    // Reader/Writer SHALL be FSD T4AT,MIN
+                    // (set to 256 in Appendix B.6).
+                    param: 0x80,
                 })
                 .await?
             }
-            (nci::RfInterfaceType::NfcDep, rf::Technology::NfcA) => {
+            (nci::RfProtocolType::NfcDep, rf::Technology::NfcA) => {
                 self.send_rf(rf::NfcDepSelectCommandBuilder {
                     sender: self.id,
                     receiver: state.rf_poll_responses[rf_discovery_id].id,
@@ -1341,8 +2080,8 @@ impl Controller {
     /// Main NFCC instance routine.
     pub async fn run(
         id: u16,
-        nci_reader: NciReader,
-        nci_writer: NciWriter,
+        nci_reader: nci::Reader,
+        nci_writer: nci::Writer,
         mut rf_rx: mpsc::UnboundedReceiver<rf::RfPacket>,
         rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
     ) -> Result<()> {
